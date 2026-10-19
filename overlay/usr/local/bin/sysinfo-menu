@@ -1,0 +1,174 @@
+#!/bin/sh
+# Menu shown on tty1 after boot. Every choice is a single key press.
+. /usr/local/lib/sysinfo.sh
+
+# FAT/exFAT partitions on removable/USB disks, excluding EFI System
+# Partitions and the disk this image was booted from (label $VOLID).
+save_targets() {
+	lsblk -Pnpo NAME,FSTYPE,PARTTYPE,PKNAME 2>/dev/null |
+	while read -r line; do
+		eval "$line"   # sets NAME FSTYPE PARTTYPE PKNAME
+		dev=$NAME
+		case "$FSTYPE" in vfat|exfat) ;; *) continue ;; esac
+		case "$PARTTYPE" in c12a7328-f81f-11d2-ba4b-00a0c93ec93b|0xef) continue ;; esac
+		disk=${PKNAME:-$dev}
+		[ "$(lsblk -dno TRAN "$disk" 2>/dev/null)" = usb ] ||
+			[ "$(lsblk -dno RM "$disk" 2>/dev/null | tr -d ' ')" = 1 ] || continue
+		[ -n "$VOLID" ] && [ "$(blkid -o value -s LABEL "$disk" 2>/dev/null)" = "$VOLID" ] && continue
+		echo "$dev"
+	done
+}
+
+save_report() {  # FILE
+	src=$1
+	echo
+	echo "FAT/exFAT partitions on USB/removable drives:"
+	parts=$(save_targets)
+	if [ -z "$parts" ]; then
+		echo "  none found - plug in a FAT32/exFAT USB stick and try again."
+		return
+	fi
+	n=0
+	for p in $parts; do
+		n=$((n + 1))
+		echo "  $n) $p  $(lsblk -no SIZE,LABEL,MODEL "$p" 2>/dev/null | head -1)"
+	done
+	if [ "$n" -lt 10 ]; then
+		printf "Save to which? [1-%s, any other key cancels] " "$n"
+		until getkey; do :; done   # getkey gives up every 2s; keep waiting
+		c=$key; echo   # the key itself was echoed (echo is on during actions)
+	else
+		printf "Save to which? [1-%s, Enter=cancel] " "$n"
+		read -r c
+	fi
+	case "$c" in ''|*[!0-9]*) [ -n "$c" ] && echo "Cancelled."; return ;; esac
+	[ "$c" -ge 1 ] && [ "$c" -le "$n" ] || { echo "Invalid choice."; return; }
+	dev=$(echo "$parts" | sed -n "${c}p")
+	if mount "$dev" /mnt; then
+		serial=$(sed -n 's/^Serial: *//p' "$src" | head -1)
+		serial=$(printf %s "$serial" | tr -c 'A-Za-z0-9-' _ | cut -c1-32)
+		name="sysinfo-${serial:-unknown}-$(date +%Y%m%d-%H%M%S).txt"
+		case "$src" in *.failed) name=${name%.txt}-partial.txt ;; esac
+		cp "$src" "/mnt/$name" && sync && echo "Saved as $name on $dev"
+		umount /mnt
+	else
+		echo "Could not mount $dev"
+	fi
+}
+
+# st: "r" = a report exists, "f" = the latest run failed, "i" = the report
+# is incomplete, "p" = that failed run's partial output is available (all
+# from $STATUS), "c" = a collection is running. Any change redraws the menu.
+# partial = the latest (failed) run's output, if $STATUS says .failed is it.
+# view = the file v and s act on: the report, or else that partial output.
+# No forks: the menu polls this every 2s.
+state() {
+	st= view= partial= outcome= quality= ours=
+	[ -f "$REPORT" ] && st=r
+	[ -f "$STATUS" ] && read -r outcome quality ours _ <"$STATUS"
+	[ "$outcome" = failed ] && st=${st}f
+	[ "$quality" = incomplete ] && st=${st}i
+	[ "$ours" = yes ] && [ -f "$REPORT.failed" ] && partial=$REPORT.failed &&
+		st=${st}p
+	running && st=${st}c
+	if [ -f "$REPORT" ]; then view=$REPORT
+	else view=$partial
+	fi
+}
+
+ESC=$(printf '\033')
+
+# Read one key into $key (lowercased). Gives up after 2s (status 1) so the
+# caller can check for a state change. Escape sequences (arrows, F-keys) are
+# drained and come back as "esc". If the terminal is gone (reads keep
+# failing instantly), exit so init respawns the menu instead of spinning.
+fast_fails=0
+getkey() {
+	read -r start _ </proc/uptime
+	read -n 1 -t 2 -r key
+	rc=$?
+	if [ "$key" = "$ESC" ]; then
+		while read -n 1 -t 0.05 -r _; do :; done
+		key=esc
+	fi
+	if [ $rc -ne 0 ]; then
+		read -r now _ </proc/uptime
+		if [ "${now%.*}" = "${start%.*}" ]; then
+			fast_fails=$((fast_fails + 1))
+			[ $fast_fails -ge 5 ] && exit 1
+		fi
+		return 1
+	fi
+	fast_fails=0
+	case "$key" in [A-Z]) key=$(printf %s "$key" | tr A-Z a-z) ;; esac
+}
+
+stty -echo 2>/dev/null   # keys are acted on, not echoed; actions re-enable it
+while true; do
+	state; drawn=$st
+	clear
+	echo "==================== SYSINFO ===================="
+	case "$st" in
+		r*) sed -n '/^CPU SUMMARY/,/^$/p' "$REPORT" | head -12 ;;
+		*c) echo "Collecting hardware information..."; echo ;;
+		*)  echo "The report could not be collected; see $LOG."
+		    [ -n "$view" ] && echo "v and s show/save the partial output."; echo ;;
+	esac
+	# A failed re-run's own output, offered next to the previous report.
+	failed_out=
+	case "$st" in r*f*)
+		echo "  !! The last re-run FAILED; this is the previous report."
+		failed_out=$partial
+		echo ;;
+	esac
+	case "$st" in r*i*)
+		echo "  !! This report is INCOMPLETE (tools missing); see its first lines."
+		echo ;;
+	esac
+	if [ "$view" = "$REPORT" ]; then
+		echo "  v) View full report (Enter)  s) Save report to USB"
+	elif [ -n "$view" ]; then
+		echo "  v) View partial output (Enter)  s) Save it to USB"
+	fi
+	[ -n "$failed_out" ] &&
+		echo "  o) View the failed run's output    w) Save it to USB"
+	case "$st" in *c) ;; *) echo "  r) Re-run report" ;; esac
+	echo "  x) Shell  (also Alt+F2)      b) Reboot      p) Power off"
+	case "$st" in r*c) echo "  (re-collecting in the background...)" ;; esac
+	drawn_view=$view
+	printf "> "
+
+	# Wait for a key; redraw on our own when the state changes, including
+	# collections started elsewhere (e.g. from the Alt+F2 shell).
+	while true; do
+		if ! getkey; then
+			state
+			[ "$st" = "$drawn" ] || continue 2
+			continue
+		fi
+		case "$key:$drawn_view" in
+			v:?*|:?*) action=view; target=$drawn_view ;;
+			s:?*) action=save; target=$drawn_view ;;
+			o:*) [ -n "$failed_out" ] || continue; action=view; target=$failed_out ;;
+			w:*) [ -n "$failed_out" ] || continue; action=save; target=$failed_out ;;
+			*) case "$key:$drawn" in
+				r:*c) continue ;;   # already collecting
+				r:*) action=rerun ;;
+				x:*|b:*|p:*) action=$key ;;
+				*) continue ;;   # not an option here: ignore without redrawing
+			esac ;;
+		esac
+		break
+	done
+	echo "$key"
+	stty echo 2>/dev/null
+	case "$action" in
+		view) less "$target" ;;
+		save) save_report "$target"; printf "Press any key..."; until getkey; do :; done ;;
+		rerun) setsid sysinfo-collect ;;
+		x) echo "Type 'exit' to return."; /bin/sh -l ;;
+		b) sync; reboot -f ;;
+		p) sync; poweroff -f ;;
+	esac
+	stty -echo 2>/dev/null
+done

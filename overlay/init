@@ -1,0 +1,37 @@
+#!/bin/sh
+# PID 1 of the sysinfo live image: bring up hardware, then show the report.
+export PATH=/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export TERM=linux LESS=-R
+
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev
+mkdir -p /dev/pts /run /tmp /mnt
+mount -t devpts devpts /dev/pts
+mount -t tmpfs tmpfs /run
+mount -t tmpfs tmpfs /tmp
+[ -d /sys/firmware/efi/efivars ] && mount -t efivarfs efivarfs /sys/firmware/efi/efivars 2>/dev/null
+dmesg -n 1
+
+echo "sysinfo: loading drivers..."
+# One netlink listener loads drivers for devices that appear from now on
+# (children of newly loaded bus drivers, hot-plugged keyboards and sticks).
+mdev -d
+# Coldplug: load a driver for every device the kernel has already seen.
+find /sys/devices -name modalias -exec cat {} + 2>/dev/null | sort -u |
+	xargs -r modprobe -qa 2>/dev/null
+modprobe -qa usbhid hid_generic sd_mod sr_mod usb_storage uas nvme ahci \
+	vfat exfat nls_cp437 nls_iso8859_1 2>/dev/null
+
+# Spare root shell on tty2 (Alt+F2).
+(while true; do setsid -c /bin/sh -l <>/dev/tty2 >&0 2>&1; done &)
+
+# Network + report run in the background (logged to $LOG, see
+# /etc/sysinfo.conf) so the menu, and a way to power off, is available even
+# if a hung disk stalls the report.
+sysinfo-collect --boot
+
+# Interactive menu on tty1; respawn if it ever exits.
+while true; do
+	setsid -c /usr/local/bin/sysinfo-menu <>/dev/tty1 >&0 2>&1 || sleep 1
+done

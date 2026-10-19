@@ -1,0 +1,81 @@
+#!/bin/sh
+# Regenerate the report in the background; returns once the lock is held.
+#   sysinfo-collect            re-collect (no-op if one is already running)
+#   sysinfo-collect --boot     bring up the network first, then mirror the
+#                              report to the serial console when done
+#   sysinfo-collect --running  exit status 0 while a collection is in progress
+# The previous report stays in place until a complete new one replaces it.
+. /usr/local/lib/sysinfo.sh
+
+case "$1" in
+--running)
+	running; exit ;;
+--run)   # internal: runs under `flock`, which holds the lock for us
+	[ "$2" = --boot ] && sysinfo-netup
+	# Per-run output file (unique even if a PID is reused), so a sysinfo
+	# orphaned by a killed earlier run (the lock is released when its
+	# collector dies) cannot write into ours. Files of runs whose collector is
+	# gone are removed; the name starts with the collector's PID.
+	for f in "$REPORT".new.*; do
+		[ -e "$f" ] || continue
+		pid=${f#"$REPORT".new.}; pid=${pid%%.*}
+		grep -q sysinfo-collect "/proc/$pid/cmdline" 2>/dev/null || rm -f "$f"
+	done
+	if tmp=$(mktemp "$REPORT.new.$$.XXXXXX"); then
+		sysinfo > "$tmp" 2>&1
+		rc=$?
+	else
+		echo "sysinfo-collect: cannot create a file in ${REPORT%/*} (full?)" >&2
+		tmp=
+	fi
+	# The installed report's quality is tracked apart from the latest run's
+	# outcome, so a failed re-run does not hide that the report it falls back
+	# to is itself incomplete.
+	quality=
+	[ -f "$STATUS" ] && read -r _ quality _ <"$STATUS"
+	# A report that reached its last line replaces the previous one, even if
+	# a tool was missing (it is still the best data; its ERROR lines say what
+	# is missing). Anything else is kept apart and the previous report stays.
+	partial=no
+	if [ -n "$tmp" ] && grep -q '^Report time:' "$tmp"; then
+		mv -f "$tmp" "$REPORT"
+		rm -f "$REPORT.failed"
+		[ $rc -eq 0 ] && outcome=ok || outcome=incomplete
+		quality=$outcome
+	else
+		# $STATUS says whether .failed is ours, so an older run's file that
+		# could not be removed (e.g. /tmp read-only) is never offered as ours.
+		if [ -n "$tmp" ] && mv -f "$tmp" "$REPORT.failed"; then partial=yes
+		else rm -f "$REPORT.failed"
+		fi
+		outcome=failed
+	fi
+	# Written last and atomically: the menu's notes are based on it.
+	echo "$outcome ${quality:-none} $partial" > "$STATUS.tmp" &&
+		mv -f "$STATUS.tmp" "$STATUS"
+	if [ "$2" = --boot ] && grep -q 'console=ttyS0' /proc/cmdline &&
+	   [ -c /dev/ttyS0 ]; then   # headless use
+		if [ -f "$REPORT" ]; then
+			cat "$REPORT"
+		elif [ $partial = yes ]; then
+			echo "sysinfo: the report could not be collected; partial output:"
+			cat "$REPORT.failed"
+		else
+			echo "sysinfo: the report could not be collected; see $LOG"
+		fi > /dev/ttyS0
+	fi
+	exit ;;
+""|--boot) ;;
+*)
+	echo "usage: sysinfo-collect [--boot | --running]" >&2
+	exit 2 ;;
+esac
+
+running && exit 0
+# flock stays alive as the collector's parent while holding the lock (so it is
+# visible in /proc/locks) and releases it when the collector exits or dies.
+# If another start wins the race, flock -n simply exits.
+flock -n "$LOCK" "$0" --run "$1" </dev/null >>"$LOG" 2>&1 &
+# Give the lock a moment to appear so callers see the new state right away.
+i=0
+while ! running && [ $i -lt 10 ]; do sleep 0.1; i=$((i + 1)); done

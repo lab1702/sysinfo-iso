@@ -1,0 +1,19 @@
+#!/bin/sh
+# Bring up every wired interface and try DHCP on those with a link.
+ip link set lo up
+for i in /sys/class/net/*; do
+	n=${i##*/}
+	[ "$n" = lo ] && continue
+	ip link set "$n" up 2>/dev/null
+	# Wait up to 5s for a link, then try DHCP (4 tries x 2s): ~13s worst case.
+	(
+		t=0
+		while [ "$(cat "$i/carrier" 2>/dev/null)" != 1 ] && [ $t -lt 10 ]; do
+			sleep 0.5; t=$((t + 1))
+		done
+		[ "$(cat "$i/carrier" 2>/dev/null)" = 1 ] &&
+			udhcpc -i "$n" -n -q -t 4 -T 2 -s /usr/share/udhcpc/default.script >/dev/null 2>&1
+	) &
+done
+sleep 2   # let USB disks settle
+wait      # for the DHCP jobs above

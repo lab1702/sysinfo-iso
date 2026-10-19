@@ -1,0 +1,208 @@
+#!/bin/sh
+# Print a full hardware report to stdout.
+
+section() { printf '\n%s\n%s\n' "$1" "$(echo "$1" | sed 's/./=/g')"; }
+sub() { printf '\n--- %s ---\n' "$1"; }
+
+# Exit non-zero when a tool the report depends on is missing, so callers can
+# tell an incomplete report from a good one.
+status=0
+for t in lscpu lsblk lspci lsusb dmidecode smartctl ethtool ip; do
+	command -v "$t" >/dev/null 2>&1 ||
+		{ echo "ERROR: $t not found; the report is incomplete" >&2; status=1; }
+done
+
+# One PCI scan for the whole report. pci CLASSES prints devices whose class
+# code starts with one of the given prefixes, e.g. "03" or "0106|0108".
+PCI=$(lspci -Dnn)
+pci() { echo "$PCI" | grep -E " \[($1)[0-9a-f]*\]: "; }
+
+FLAGS=" $(grep -m1 '^flags' /proc/cpuinfo | cut -d: -f2) "
+
+# Echo the flags from $@ that the CPU lacks.
+missing() {
+	m=""
+	for f in "$@"; do
+		case "$FLAGS" in *" $f "*) ;; *) m="$m $f" ;; esac
+	done
+	echo "${m# }"
+}
+
+# x86-64 micro-architecture levels as defined by the x86-64 psABI.
+L1="lm cmov cx8 fpu fxsr mmx syscall sse sse2"
+L2="cx16 lahf_lm popcnt pni ssse3 sse4_1 sse4_2"
+L3="avx avx2 bmi1 bmi2 f16c fma abm movbe xsave"
+L4="avx512f avx512bw avx512cd avx512dq avx512vl"
+
+level_line() {  # name flags...
+	name=$1; shift
+	m=$(missing "$@")
+	if [ -z "$m" ]; then printf '  %-10s YES\n' "$name"
+	else printf '  %-10s NO   (missing: %s)\n' "$name" "$m"
+	fi
+}
+
+yn() { [ -z "$(missing "$@")" ] && echo yes || echo no; }
+
+cpu_level() {
+	lvl=none
+	[ -z "$(missing $L1)" ] && lvl=x86-64-v1 || { echo $lvl; return; }
+	[ -z "$(missing $L2)" ] && lvl=x86-64-v2 || { echo $lvl; return; }
+	[ -z "$(missing $L3)" ] && lvl=x86-64-v3 || { echo $lvl; return; }
+	[ -z "$(missing $L4)" ] && lvl=x86-64-v4
+	echo $lvl
+}
+
+dmi() { dmidecode -s "$1" 2>/dev/null | grep -v '^#' | head -1; }
+
+# ---------------------------------------------------------------------------
+section "CPU SUMMARY"
+MODEL=$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | sed 's/^ *//')
+SOCKETS=$(grep 'physical id' /proc/cpuinfo | sort -u | wc -l); [ "$SOCKETS" -eq 0 ] && SOCKETS=1
+CORES=$(lscpu -p=CORE,SOCKET 2>/dev/null | grep -v '^#' | sort -u | wc -l)
+THREADS=$(grep -c ^processor /proc/cpuinfo)
+LEVEL=$(cpu_level)
+echo "Model:          $MODEL"
+echo "Topology:       $SOCKETS socket(s), $CORES core(s), $THREADS thread(s)"
+echo "x86-64 level:   $LEVEL"
+case "$LEVEL" in
+	x86-64-v3|x86-64-v4) echo "AMD64v3:        SUPPORTED" ;;
+	*)                   echo "AMD64v3:        NOT SUPPORTED (missing: $(missing $L1 $L2 $L3))" ;;
+esac
+echo "Memory:         $(awk '/MemTotal/{printf "%.1f GiB usable", $2/1048576}' /proc/meminfo)"
+echo "System:         $(dmi system-manufacturer) $(dmi system-product-name)"
+echo
+
+# ---------------------------------------------------------------------------
+section "SYSTEM / FIRMWARE"
+echo "Manufacturer:   $(dmi system-manufacturer)"
+echo "Product:        $(dmi system-product-name) $(dmi system-version)"
+echo "Serial:         $(dmi system-serial-number)"
+echo "UUID:           $(dmi system-uuid)"
+echo "Board:          $(dmi baseboard-manufacturer) $(dmi baseboard-product-name) $(dmi baseboard-version)"
+echo "BIOS:           $(dmi bios-vendor) $(dmi bios-version) ($(dmi bios-release-date))"
+if [ -d /sys/firmware/efi ]; then
+	sb=$(od -An -tu1 -j4 -N1 /sys/firmware/efi/efivars/SecureBoot-* 2>/dev/null | tr -d ' ')
+	case "$sb" in 1) sb=enabled ;; *) sb=disabled ;; esac
+	echo "Boot mode:      UEFI ($(cat /sys/firmware/efi/fw_platform_size 2>/dev/null)-bit), Secure Boot $sb"
+else
+	echo "Boot mode:      Legacy BIOS"
+fi
+if [ -e /sys/class/tpm/tpm0 ]; then
+	echo "TPM:            present (version $(cat /sys/class/tpm/tpm0/tpm_version_major 2>/dev/null || echo '?'))"
+else
+	echo "TPM:            not detected"
+fi
+case "$FLAGS" in *" hypervisor "*) echo "Virtualized:    yes (running under a hypervisor)" ;; esac
+echo "Kernel:         $(uname -r)"
+
+# ---------------------------------------------------------------------------
+section "CPU"
+lscpu
+sub "x86-64 micro-architecture levels"
+level_line x86-64-v1 $L1
+level_line x86-64-v2 $L2
+level_line x86-64-v3 $L3
+level_line x86-64-v4 $L4
+sub "Notable features"
+printf '  %-28s %s\n' \
+	"Hardware virtualization:" "$( [ "$(yn vmx)" = yes ] && echo 'Intel VT-x' || { [ "$(yn svm)" = yes ] && echo 'AMD-V' || echo no; })" \
+	"AES-NI:" "$(yn aes)" \
+	"SHA extensions:" "$(yn sha_ni)" \
+	"AVX-512 (foundation):" "$(yn avx512f)" \
+	"AVX-VNNI:" "$(yn avx_vnni)" \
+	"AMX:" "$(yn amx_tile)" \
+	"RDRAND / RDSEED:" "$(yn rdrand) / $(yn rdseed)" \
+	"NX bit:" "$(yn nx)" \
+	"Microcode revision:" "$(grep -m1 microcode /proc/cpuinfo | cut -d: -f2 | tr -d ' ')"
+
+# ---------------------------------------------------------------------------
+section "MEMORY"
+free -m | sed 's/^/  /'
+sub "Memory array"
+dmidecode -t 16 2>/dev/null | grep -E 'Maximum Capacity|Number Of Devices|Error Correction Type' | sed 's/^\s*/  /'
+sub "Installed modules"
+dmidecode -t 17 2>/dev/null | awk -F': ' '
+	function flush() {
+		if (size != "" && size !~ /No Module|Not Installed|^0/)
+			printf "  %-18s %-9s %-6s %-6s %s MT/s (rated %s) %s %s rank:%s\n",
+				loc, size, type, ff, cspeed, speed, mfr, part, rank
+		size = loc = type = ff = speed = cspeed = mfr = part = rank = ""
+	}
+	/^Memory Device/ { flush() }
+	/^\tSize:/ { size = $2 }
+	/^\tLocator:/ { loc = $2 }
+	/^\tType:/ { type = $2 }
+	/^\tForm Factor:/ { ff = $2 }
+	/^\tSpeed:/ { speed = $2; sub(/ MT\/s/, "", speed) }
+	/^\tConfigured Memory Speed:/ { cspeed = $2; sub(/ MT\/s/, "", cspeed) }
+	/^\tManufacturer:/ { mfr = $2 }
+	/^\tPart Number:/ { part = $2; gsub(/ +$/, "", part) }
+	/^\tRank:/ { rank = $2 }
+	END { flush() }'
+
+# ---------------------------------------------------------------------------
+section "GPU / DISPLAY"
+pci 03
+for dev in $(pci 03 | cut -d' ' -f1); do
+	sub "$dev"
+	lspci -vnn -s "$dev" | grep -E 'Subsystem|Memory at|Kernel driver|Kernel modules' | sed 's/^\s*/  /'
+	lspci -vv -s "$dev" 2>/dev/null | grep -E 'LnkCap:|LnkSta:' | sed 's/^\s*/  /' | cut -c1-70
+done
+if ls /sys/class/drm/card*-*/edid >/dev/null 2>&1; then
+	sub "Connected outputs"
+	for c in /sys/class/drm/card*-*; do
+		[ "$(cat "$c/status" 2>/dev/null)" = connected ] && echo "  ${c##*/}: $(head -1 "$c/modes" 2>/dev/null)"
+	done
+fi
+[ -e /dev/fb0 ] && echo "Framebuffer:    $(cat /sys/class/graphics/fb0/name 2>/dev/null) $(cat /sys/class/graphics/fb0/virtual_size 2>/dev/null)"
+
+# ---------------------------------------------------------------------------
+section "STORAGE"
+lsblk -d -e 1,2,7,11 -o NAME,MODEL,SERIAL,SIZE,ROTA,TRAN,TYPE
+sub "Partitions"
+lsblk -e 1,2,7,11 -o NAME,SIZE,FSTYPE,LABEL,PARTLABEL
+sub "Storage controllers"
+pci 01
+for d in $(lsblk -dn -e 1,2,7,11 -o NAME); do
+	sub "/dev/$d"
+	timeout 20 smartctl -i -H -A "/dev/$d" 2>/dev/null | sed -n '/=== START OF INFORMATION/,$p' |
+		grep -E 'Model|Serial|Firmware|Capacity|Rotation|Form Factor|SATA Version|NVMe Version|PCI Vendor|overall-health|Power_On_Hours|Power On Hours|Temperature|Percentage Used|Data Units Written|Reallocated_Sector|Wear_Leveling|Media and Data Integrity' |
+		sed 's/^/  /'
+done
+
+# ---------------------------------------------------------------------------
+section "NETWORK"
+pci "02|0d80"
+for i in /sys/class/net/*; do
+	n=${i##*/}
+	[ "$n" = lo ] && continue
+	sub "$n"
+	echo "  MAC:          $(cat "$i/address")"
+	echo "  Driver:       $(ethtool -i "$n" 2>/dev/null | awk '/^driver/{d=$2} /^firmware-version/{f=$0; sub(/firmware-version: /,"",f)} END{print d, (f!="" ? "(fw " f ")" : "")}')"
+	echo "  State:        $(cat "$i/operstate")"
+	sp=$(cat "$i/speed" 2>/dev/null)
+	[ -n "$sp" ] && [ "$sp" -gt 0 ] 2>/dev/null && echo "  Link speed:   ${sp} Mb/s $(cat "$i/duplex" 2>/dev/null) duplex"
+	modes=$(ethtool "$n" 2>/dev/null | sed -n '/Supported link modes/,/Supported pause/p' | grep -oE '[0-9]+base[A-Za-z0-9]+/Full' | sort -un | tr '\n' ' ')
+	[ -n "$modes" ] && echo "  Supported:    $modes"
+	ip -4 -br addr show "$n" | awk '$3{print "  IPv4:         " $3}'
+	ip -6 -br addr show "$n" | awk '{for(i=3;i<=NF;i++) print "  IPv6:         " $i}'
+done
+if [ -n "$(pci "0280|0d80")" ]; then
+	echo
+	echo "(Wi-Fi adapters are listed above by PCI ID; Wi-Fi drivers are not included.)"
+fi
+sub "Routes"
+ip route 2>/dev/null | sed 's/^/  /'
+
+# ---------------------------------------------------------------------------
+section "USB DEVICES"
+timeout 10 lsusb 2>/dev/null
+
+section "ALL PCI DEVICES"
+lspci -nnk | grep -v 'Kernel modules'
+
+section "BOOT"
+echo "Command line:   $(cat /proc/cmdline)"
+echo "Report time:    $(date -u '+%Y-%m-%d %H:%M:%S UTC') (from RTC)"
+exit $status
